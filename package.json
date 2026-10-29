@@ -1,0 +1,15 @@
+{
+  "name": "file-wiki",
+  "private": true,
+  "type": "module",
+  "description": "自动轮替的 file.kiwi 分享链接（自链：从上一轮链接取源）",
+  "scripts": {
+    "rotate": "node scripts/rotate.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@file-kiwi/node": "1.0.9"
+  }
+}

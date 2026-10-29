@@ -1,0 +1,7 @@
+node_modules/
+work/
+.tools/
+*.tgz
+SHA2-256SUMS
+.rotate-url.txt
+/.idea/

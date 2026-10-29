@@ -1,0 +1,153 @@
+name: 轮替 file.kiwi 链接
+
+# 自链：从上一轮的 file.kiwi 链接取源，重新加密上传，再回写 README。
+#
+# 为什么要每 6 小时检查一次，而不是每天一次：
+#   <10GB 文件的免费下载窗口只有 24 小时（官方 v2 文档），而 6GB 的
+#   下载 + 上传要占掉一段时间。每 6 小时跑一次、只在链接超过 12 小时
+#   时才真正轮替，等于给失败留了一次重试机会；一天成功轮替 2 次。
+#
+# 失败不会破坏现有链接：README 只在「新链接上传完成且 probe 通过」之后才改写。
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 忽略新鲜度检查，立即轮替
+        type: boolean
+        default: true
+      source_url:
+        description: 临时指定源地址（file.kiwi 链接或外部 HTTP 地址），留空则用 README 里的链接
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: rotate
+  cancel-in-progress: false
+
+env:
+  FILEKIWI_VERSION: '2026.10.28'
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # 6GB 源文件 + 上传分片，标准 runner 约 14GB 空间不够用。
+      - name: 清理磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: 安装上传 SDK
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      # aria2 静态构建（P3TERX），比下载器内置引擎快得多；
+      # 下载器会自动探测 PATH 上的 aria2c，不需要额外参数。
+      - name: 安装 aria2
+        env:
+          ARIA2_TAG: '1.36.0_2021.08.22'
+          ARIA2_FILE: 'aria2-1.36.0-static-linux-amd64.tar.gz'
+          ARIA2_SHA256: ${{ vars.ARIA2_SHA256 }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/P3TERX/Aria2-Pro-Core/releases/download/${ARIA2_TAG}"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$ARIA2_FILE" "$base/$ARIA2_FILE"
+          got="$(sha256sum "$ARIA2_FILE" | cut -d' ' -f1)"
+          if [ -n "${ARIA2_SHA256:-}" ]; then
+            [ "$got" = "${ARIA2_SHA256,,}" ] || { echo "::error::aria2 校验失败：实际 $got"; exit 1; }
+            echo "aria2 校验通过"
+          else
+            echo "::notice::没有配置 ARIA2_SHA256，本次下载的 SHA-256 为 $got —— 存成仓库变量即可强制校验。"
+          fi
+          mkdir -p .tools/aria2
+          tar -xzf "$ARIA2_FILE" -C .tools/aria2
+          bin="$(find .tools/aria2 -type f -name aria2c -print -quit)"
+          [ -n "$bin" ] || { echo "::error::压缩包里找不到 aria2c"; exit 1; }
+          chmod +x "$bin"
+          echo "$PWD/$(dirname "$bin")" >> "$GITHUB_PATH"
+          ver="$("$bin" --version | head -n1)"
+          echo "$ver"
+          case "$ver" in
+            *1.36.0*) ;;
+            *) echo "::error::aria2 版本不是 1.36.0：$ver"; exit 1 ;;
+          esac
+
+      # 下载器是预编译的 Node SEA 单文件程序，官方不提供 macOS 构建。
+      - name: 安装下载器
+        env:
+          V: ${{ env.FILEKIWI_VERSION }}
+        run: |
+          set -euo pipefail
+          asset="filekiwi-${V}-linux-x64.tar.gz"
+          base="https://github.com/codexonly/filekiwi-dlp/releases/download/${V}"
+          curl -fsSL --retry 3 --retry-delay 5 -o "$asset" "$base/$asset"
+          curl -fsSL --retry 3 --retry-delay 5 -o SHA2-256SUMS "$base/SHA2-256SUMS"
+          if grep -q "$asset" SHA2-256SUMS; then
+            grep "$asset" SHA2-256SUMS | sha256sum -c -
+          else
+            echo "::warning::SHA2-256SUMS 中没有 $asset，跳过校验"
+          fi
+          mkdir -p .tools
+          tar -xzf "$asset" -C .tools
+          bin="$(find .tools -type f -name filekiwi -print -quit)"
+          [ -n "$bin" ] || { echo "::error::压缩包里找不到 filekiwi"; exit 1; }
+          chmod +x "$bin"
+          echo "FILEKIWI_BIN=$PWD/$bin" >> "$GITHUB_ENV"
+          "$PWD/$bin" --version
+
+      - name: 执行轮替
+        id: rotate
+        env:
+          SOURCE_URL: ${{ inputs.source_url || secrets.SOURCE_URL }}
+          SOURCE_SHA256: ${{ vars.SOURCE_SHA256 }}
+          TITLE: ${{ vars.TITLE }}
+          MIN_AGE_HOURS: ${{ vars.MIN_AGE_HOURS || '12' }}
+          FORCE: ${{ inputs.force }}
+        run: node scripts/rotate.mjs
+
+      - name: 提交 README
+        if: steps.rotate.outputs.rotated == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "没有变化"
+          else
+            git commit -m "chore: 轮替 file.kiwi 链接 [skip ci]"
+            git push
+          fi
+
+      - name: 失败时开 issue 提醒
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="轮替失败，README 里的链接未被改动，但正在变旧。
+
+          运行日志：${RUN_URL}
+
+          常见原因：源链接已过期、上传中断、下载器接口变更。"
+          existing="$(gh issue list --state open --search '轮替失败 in:title' --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "轮替失败：$(date -u +%Y-%m-%d)" --body "$body"
+          fi
