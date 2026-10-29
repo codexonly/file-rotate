@@ -1,4 +1,4 @@
-name: 轮替 file.kiwi 链接
+name: file-rotate
 
 # 自链：从上一轮的 file.kiwi 链接取源，重新加密上传，再回写 README。
 #
