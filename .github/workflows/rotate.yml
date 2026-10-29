@@ -41,6 +41,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 镜像到 Codeberg 需要完整历史：浅克隆会被远端以 "shallow update not allowed" 拒绝。
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -133,6 +136,42 @@ jobs:
             git commit -m "chore: 轮替 file.kiwi 链接 [skip ci]"
             git push
           fi
+
+      # Codeberg 只读镜像：GitHub 是唯一真源，这里强制覆盖。
+      - name: 同步到 Codeberg
+        if: steps.rotate.outputs.rotated == 'true'
+        env:
+          SSH_KEY: ${{ secrets.CODEBERG_SSH_KEY }}
+          KNOWN_HOSTS: ${{ vars.CODEBERG_KNOWN_HOSTS }}
+          REPO: ${{ vars.CODEBERG_REPO }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ -z "${REPO:-}" ]; then
+            echo "::notice::未配置 CODEBERG_REPO，跳过镜像。"
+            exit 0
+          fi
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "::error::配置了 CODEBERG_REPO，但缺少 CODEBERG_SSH_KEY（Codeberg 写权限的部署密钥）。"
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/codeberg
+          chmod 600 ~/.ssh/codeberg
+          if [ -n "${KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            echo "::notice::未配置 CODEBERG_KNOWN_HOSTS，改用 ssh-keyscan（首次连接即信任，属 TOFU）。"
+            ssh-keyscan -t ed25519,rsa codeberg.org >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          [ -s ~/.ssh/known_hosts ] || {
+            echo "::error::拿不到 codeberg.org 的主机密钥，检查出站 22 端口，或配置 CODEBERG_KNOWN_HOSTS。"
+            exit 1
+          }
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/codeberg -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git remote add codeberg "git@codeberg.org:${REPO}.git" 2>/dev/null \
+            || git remote set-url codeberg "git@codeberg.org:${REPO}.git"
+          git push --force codeberg "HEAD:refs/heads/${BRANCH}"
+          echo "::notice::已镜像到 https://codeberg.org/${REPO}/tree/${BRANCH}"
 
       - name: 失败时开 issue 提醒
         if: failure()
